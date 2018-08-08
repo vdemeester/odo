@@ -557,12 +557,24 @@ func (c *Client) NewAppS2I(name string, builderImage string, gitUrl string, labe
 
 }
 
-// BootstrapSupervisoredS2I uses s2i to inject Supervisor into builder image.
-// Supervisor keeps pod running (runs as pid1), so you it is possible to trigger assembly script inside running pod,
-// and than restart application using Supervisor without need to restart whole container.
-// inputPorts is the array containing the string port values
+// BootstrapSupervisoredS2I uses S2I (Source To Image) to inject Supervisor into the application container.
+// Odo uses https://github.com/ochinchina/supervisord which is pre-built in a ready-to-deploy InitContainer.
+// The supervisord binary is copied over to the application container using a temporary volume and overrides
+// the built-in S2I run function for the supervisord run command instead.
+//
+// Supervisor keeps the pod running (as PID 1), so you it is possible to trigger assembly script inside running pod,
+// and than restart application using Supervisor without need to restart the container/Pod.
+//
 func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labels map[string]string, annotations map[string]string, inputPorts []string) error {
+
 	imageName, imageTag, _, err := ParseImageName(builderImage)
+
+	log.Debugf("Bootstrap image: %s", builderImage)
+
+	// Volume names
+	appRootVolumeName := fmt.Sprintf("%s-s2idata", name)
+	supervisordVolume := "shared-data"
+	internalRepo := "docker-registry.default.svc:5000/openshift"
 
 	if err != nil {
 		return errors.Wrap(err, "unable to create new s2i git build ")
@@ -597,44 +609,7 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 		return errors.Wrapf(err, "unable to create ImageStream for %s", name)
 	}
 
-	// generate BuildConfig
-	buildSource := buildv1.BuildSource{
-		Git: &buildv1.GitBuildSource{
-			URI: bootstrapperURI,
-			Ref: bootstrapperRef,
-		},
-		Type: buildv1.BuildSourceGit,
-	}
-
-	bc := buildv1.BuildConfig{
-		ObjectMeta: commonObjectMeta,
-		Spec: buildv1.BuildConfigSpec{
-			CommonSpec: buildv1.CommonSpec{
-				Output: buildv1.BuildOutput{
-					To: &corev1.ObjectReference{
-						Kind: "ImageStreamTag",
-						Name: name + ":latest",
-					},
-				},
-				Source: buildSource,
-				Strategy: buildv1.BuildStrategy{
-					SourceStrategy: &buildv1.SourceBuildStrategy{
-						From: corev1.ObjectReference{
-							Kind:      "ImageStreamTag",
-							Name:      imageName + ":" + imageTag,
-							Namespace: OpenShiftNameSpace,
-						},
-					},
-				},
-			},
-		},
-	}
-	_, err = c.buildClient.BuildConfigs(c.namespace).Create(&bc)
-	if err != nil {
-		return errors.Wrapf(err, "unable to create BuildConfig for %s", name)
-	}
-
-	// generate  and create DeploymentConfig
+	// Generates and deploys a DeploymentConfig with an InitContainer to copy over the SupervisorD binary.
 	dc := appsv1.DeploymentConfig{
 		ObjectMeta: commonObjectMeta,
 		Spec: appsv1.DeploymentConfigSpec{
@@ -649,15 +624,48 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 					},
 				},
 				Spec: corev1.PodSpec{
+
+					// The application container
 					Containers: []corev1.Container{
 						{
-							Image: bc.Spec.Output.To.Name,
+							Image: fmt.Sprintf("%s/%s:latest", internalRepo, builderImage),
 							Name:  name,
 							Ports: containerPorts,
+							// Run the actual supervisord binary
+							Command: []string{
+								"/var/lib/supervisord/bin/supervisord",
+							},
+							Args: []string{
+								"-c",
+								"/var/lib/supervisord/conf/supervisor.conf",
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      supervisordVolume,
+									MountPath: "/var/lib/supervisord",
+								},
+							},
 						},
+					},
+
+					// Create a volume that will be shared betwen InitContainer and the applicationContainer
+					// in order to pass over the SupervisorD binary
+					Volumes: []corev1.Volume{
+						{
+							Name: supervisordVolume,
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					},
+
+					// Here we add the SupervisorD container
+					InitContainers: []corev1.Container{
+						supervisordInitContainer("supervisord-copy", appRootVolumeName),
 					},
 				},
 			},
+			// Retrieve the actual deployment image
 			Triggers: []appsv1.DeploymentTriggerPolicy{
 				{
 					Type: "ConfigChange",
@@ -668,11 +676,11 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 						Automatic: true,
 						ContainerNames: []string{
 							name,
-							"copy-files-to-volume",
 						},
 						From: corev1.ObjectReference{
-							Kind: "ImageStreamTag",
-							Name: bc.Spec.Output.To.Name,
+							Kind:      "ImageStreamTag",
+							Name:      builderImage + ":latest",
+							Namespace: OpenShiftNameSpace,
 						},
 					},
 				},
@@ -1927,4 +1935,52 @@ func getContainerPortsFromStrings(ports []string) ([]corev1.ContainerPort, error
 		containerPorts = append(containerPorts, port)
 	}
 	return containerPorts, nil
+}
+
+// Create supervisordInitContainer
+func supervisordInitContainer(name string, appRootVolumeName string) corev1.Container {
+
+	// InitContainer const image
+	// TODO: Const somewhere else maybe?
+	const supervisorImage = "docker.io/cdrage/supervisord-test:latest"
+
+	// Return the initContainer
+	return corev1.Container{
+		Name:  name,
+		Image: supervisorImage,
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      appRootVolumeName,
+				MountPath: "/var/lib/supervisord",
+			},
+		},
+		Command: []string{
+			"/usr/bin/cp",
+		},
+		Args: []string{
+			"-r",
+			"/opt/supervisord",
+			"/var/lib/",
+		},
+		// TODO : The following list should be calculated based on the labels of the S2I image
+		// TODO: Ignore ^^, we should be getting the arguments from inside the source-to-image container
+		Env: []corev1.EnvVar{
+			{
+				Name:  "CMDS",
+				Value: "echo:/var/lib/supervisord/conf/echo.sh;run-java:/usr/local/s2i/run;compile-java:/usr/local/s2i/assemble;build:/deployments/buildapp",
+			},
+		},
+	}
+}
+
+// CreateImageStream function
+func CreateImageStream(objectMeta metav1.ObjectMeta) imagev1.ImageStream {
+	return imagev1.ImageStream{
+		ObjectMeta: objectMeta,
+		Spec: {
+			Tags: {
+				TagReference{},
+			},
+		},
+	}
 }
