@@ -60,7 +60,7 @@ const (
 	nameLength = 5
 	// git repository that will be used for bootstraping
 	bootstrapperURI = "https://github.com/kadel/bootstrap-supervisored-s2i"
-	bootstrapperRef = "v0.0.2"
+	bootstrapperRef = "find-scripts"
 )
 
 // errorMsg is the message for user when invalid configuration error occurs
