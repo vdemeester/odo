@@ -574,7 +574,6 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 	// Volume names
 	appRootVolumeName := fmt.Sprintf("%s-s2idata", name)
 	supervisordVolume := "shared-data"
-	internalRepo := "docker-registry.default.svc:5000/openshift"
 
 	if err != nil {
 		return errors.Wrap(err, "unable to create new s2i git build ")
@@ -628,7 +627,7 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 					// The application container
 					Containers: []corev1.Container{
 						{
-							Image: fmt.Sprintf("%s/%s:latest", internalRepo, builderImage),
+							Image: fmt.Sprintf("%s/%s:latest", OpenShiftNameSpace, builderImage),
 							Name:  name,
 							Ports: containerPorts,
 							// Run the actual supervisord binary
@@ -676,6 +675,7 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 						Automatic: true,
 						ContainerNames: []string{
 							name,
+							"copy-files-to-volume",
 						},
 						From: corev1.ObjectReference{
 							Kind:      "ImageStreamTag",
@@ -1968,18 +1968,6 @@ func supervisordInitContainer(name string, appRootVolumeName string) corev1.Cont
 			{
 				Name:  "CMDS",
 				Value: "echo:/var/lib/supervisord/conf/echo.sh;run-java:/usr/local/s2i/run;compile-java:/usr/local/s2i/assemble;build:/deployments/buildapp",
-			},
-		},
-	}
-}
-
-// CreateImageStream function
-func CreateImageStream(objectMeta metav1.ObjectMeta) imagev1.ImageStream {
-	return imagev1.ImageStream{
-		ObjectMeta: objectMeta,
-		Spec: {
-			Tags: {
-				TagReference{},
 			},
 		},
 	}
