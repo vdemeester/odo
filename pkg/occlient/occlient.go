@@ -58,9 +58,14 @@ const (
 
 	// The length of the string to be generated for names of resources
 	nameLength = 5
-	// git repository that will be used for bootstraping
+
+	// Git repository that will be used for bootstraping
 	bootstrapperURI = "https://github.com/kadel/bootstrap-supervisored-s2i"
 	bootstrapperRef = "v0.0.2"
+
+	// Docker image that will be use containing the supervisord binary as well
+	// as the assemble / run / restart scripts
+	bootstrapperImage = "docker.io/cdrage/supervisord-test:latest"
 )
 
 // errorMsg is the message for user when invalid configuration error occurs
@@ -557,11 +562,16 @@ func (c *Client) NewAppS2I(name string, builderImage string, gitUrl string, labe
 
 }
 
-// BootstrapSupervisoredS2I uses s2i to inject Supervisor into builder image.
-// Supervisor keeps pod running (runs as pid1), so you it is possible to trigger assembly script inside running pod,
-// and than restart application using Supervisor without need to restart whole container.
-// inputPorts is the array containing the string port values
+// BootstrapSupervisoredS2I uses S2I (Source To Image) to inject Supervisor into the application container.
+// Odo uses https://github.com/ochinchina/supervisord which is pre-built in a ready-to-deploy InitContainer.
+// The supervisord binary is copied over to the application container using a temporary volume and overrides
+// the built-in S2I run function for the supervisord run command instead.
+//
+// Supervisor keeps the pod running (as PID 1), so you it is possible to trigger assembly script inside running pod,
+// and than restart application using Supervisor without need to restart the container/Pod.
+//
 func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labels map[string]string, annotations map[string]string, inputPorts []string) error {
+
 	imageName, imageTag, _, err := ParseImageName(builderImage)
 
 	if err != nil {
@@ -597,44 +607,7 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 		return errors.Wrapf(err, "unable to create ImageStream for %s", name)
 	}
 
-	// generate BuildConfig
-	buildSource := buildv1.BuildSource{
-		Git: &buildv1.GitBuildSource{
-			URI: bootstrapperURI,
-			Ref: bootstrapperRef,
-		},
-		Type: buildv1.BuildSourceGit,
-	}
-
-	bc := buildv1.BuildConfig{
-		ObjectMeta: commonObjectMeta,
-		Spec: buildv1.BuildConfigSpec{
-			CommonSpec: buildv1.CommonSpec{
-				Output: buildv1.BuildOutput{
-					To: &corev1.ObjectReference{
-						Kind: "ImageStreamTag",
-						Name: name + ":latest",
-					},
-				},
-				Source: buildSource,
-				Strategy: buildv1.BuildStrategy{
-					SourceStrategy: &buildv1.SourceBuildStrategy{
-						From: corev1.ObjectReference{
-							Kind:      "ImageStreamTag",
-							Name:      imageName + ":" + imageTag,
-							Namespace: OpenShiftNameSpace,
-						},
-					},
-				},
-			},
-		},
-	}
-	_, err = c.buildClient.BuildConfigs(c.namespace).Create(&bc)
-	if err != nil {
-		return errors.Wrapf(err, "unable to create BuildConfig for %s", name)
-	}
-
-	// generate  and create DeploymentConfig
+	// Generates and deploys a DeploymentConfig with an InitContainer to copy over the SupervisorD binary.
 	dc := appsv1.DeploymentConfig{
 		ObjectMeta: commonObjectMeta,
 		Spec: appsv1.DeploymentConfigSpec{
@@ -649,15 +622,46 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 					},
 				},
 				Spec: corev1.PodSpec{
+
+					// The application container
 					Containers: []corev1.Container{
 						{
-							Image: bc.Spec.Output.To.Name,
+							Image: builderImage,
 							Name:  name,
 							Ports: containerPorts,
+							// Run the actual supervisord binary that has been mounted into the container
+							Command: []string{
+								"/var/lib/supervisord/bin/supervisord",
+							},
+							// Using the appropriate configuration file that contains the "run" script for the component.
+							// either from: /usr/libexec/s2i/assemble or /opt/app-root/src/.s2i/bin/assemble
+							Args: []string{
+								"-c",
+								"/var/lib/supervisord/conf/supervisor.conf",
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "shared-data",
+									MountPath: "/var/lib/supervisord",
+								},
+							},
+						},
+					},
+
+					// Create a volume that will be shared betwen InitContainer and the applicationContainer
+					// in order to pass over the SupervisorD binary
+					Volumes: []corev1.Volume{
+						{
+							Name: "shared-data",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
 						},
 					},
 				},
 			},
+			// We provide triggers to create an ImageStream so that the application container will use the
+			// correct and approriate image that's located internally within the OpenShift namespace
 			Triggers: []appsv1.DeploymentTriggerPolicy{
 				{
 					Type: "ConfigChange",
@@ -668,11 +672,11 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 						Automatic: true,
 						ContainerNames: []string{
 							name,
-							"copy-files-to-volume",
 						},
 						From: corev1.ObjectReference{
-							Kind: "ImageStreamTag",
-							Name: bc.Spec.Output.To.Name,
+							Kind:      "ImageStreamTag",
+							Name:      fmt.Sprintf("%s:%s", imageName, imageTag),
+							Namespace: OpenShiftNameSpace,
 						},
 					},
 				},
@@ -681,6 +685,7 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 	}
 
 	addBootstrapInitContainer(&dc, name)
+	addBootstrapSupervisordInitContainer(&dc, name)
 	addBootstrapVolume(&dc, name)
 	addBootstrapVolumeMount(&dc, name)
 
@@ -740,8 +745,9 @@ func (c *Client) CreateService(commonObjectMeta metav1.ObjectMeta, containerPort
 func addBootstrapInitContainer(dc *appsv1.DeploymentConfig, dcName string) {
 	dc.Spec.Template.Spec.InitContainers = append(dc.Spec.Template.Spec.InitContainers,
 		corev1.Container{
-			Name:  "copy-files-to-volume",
-			Image: dc.Spec.Template.Spec.Containers[0].Image,
+			Name: "copy-files-to-volume",
+			// TODO need to use custom image here (copy files over + combination of supervisord image too)
+			Image: bootstrapperImage,
 			Command: []string{
 				"copy-files-to-volume",
 				"/opt/app-root",
@@ -750,6 +756,44 @@ func addBootstrapInitContainer(dc *appsv1.DeploymentConfig, dcName string) {
 				{
 					Name:      getAppRootVolumeName(dcName),
 					MountPath: "/mnt",
+				},
+			},
+		})
+}
+
+// addBootstrapSupervisordInitContainer creates an init container that will copy over
+// supervisord to the application image during the start-up procress.
+func addBootstrapSupervisordInitContainer(dc *appsv1.DeploymentConfig, dcName string) {
+
+	// TODO: Use a release process to use an appriate image based on the release (0.1.0, HEAD, etc.)
+	// TODO: Maybe even make this a configurable container (for development at least too), since this will
+	// be pulled publically
+	image := "docker.io/cdrage/supervisord-test:latest"
+
+	dc.Spec.Template.Spec.InitContainers = append(dc.Spec.Template.Spec.InitContainers,
+		corev1.Container{
+			Name:  "copy-supervisord",
+			Image: image,
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "shared-data",
+					MountPath: "/var/lib/supervisord",
+				},
+			},
+			Command: []string{
+				"/usr/bin/cp",
+			},
+			Args: []string{
+				"-r",
+				"/opt/supervisord",
+				"/var/lib/",
+			},
+			// TODO : The following list should be calculated based on the labels of the S2I image, otherwise, we should be
+			// retrieveing the arguments from either the inside of the container OR from an OpenShift label/annotation
+			Env: []corev1.EnvVar{
+				{
+					Name:  "CMDS",
+					Value: "echo:/var/lib/supervisord/conf/echo.sh;run-java:/usr/local/s2i/run;compile-java:/usr/local/s2i/assemble;build:/deployments/buildapp",
 				},
 			},
 		})

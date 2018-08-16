@@ -146,17 +146,22 @@ A full list of component types that can be deployed is available using: 'odo com
 			err = component.CreateFromPath(client, componentName, componentImageName, dir, applicationName, "local", componentPorts)
 			checkError(err, "")
 			fmt.Printf("Please wait, creating %s component ...\n", componentName)
-			err = component.Build(client, componentName, applicationName, false, true, stdout)
-			checkError(err, "")
+
+			// We are no longer building (using BuildConfig) before creating the component, hence why this is commented out.
+			//err = component.Build(client, componentName, applicationName, false, true, stdout)
+			//checkError(err, "")
+
 		} else if len(componentBinary) != 0 {
 			path, err := filepath.Abs(componentBinary)
 			checkError(err, "")
 
 			err = component.CreateFromPath(client, componentName, componentImageName, path, applicationName, "binary", componentPorts)
 			checkError(err, "")
-			fmt.Printf("Please wait, creating %s component ...\n", componentName)
-			err = component.Build(client, componentName, applicationName, false, true, stdout)
-			checkError(err, "")
+
+			// We are no longer building (using BuildConfig) before creating the component, hence why this is commented out.
+			//err = component.Build(client, componentName, applicationName, false, true, stdout)
+			//checkError(err, "")
+
 		} else {
 			// we want to use and save absolute path for component
 			dir, err := filepath.Abs("./")

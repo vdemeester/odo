@@ -1,0 +1,18 @@
+#!/bin/bash
+set -x
+set -eo pipefail
+
+# HACK. For some reason, *somewhere* $PATH is being overriden and the default
+# "/opt/rh/" is not being added. We instead manually search for the binaries and add it
+# to $PATH.
+for i in $(find /opt/rh/ -name 'bin' -type d | grep '/root/usr/bin'); do
+        PATH=$i:$PATH
+done
+
+# We now run the run script. If there is a custom one written in the 
+# source files, we use that instead.
+if [ -f /opt/app-root/src/.s2i/bin/run ]; then
+    exec /opt/app-root/src/.s2i/bin/run
+else
+    exec /usr/libexec/s2i/run
+fi

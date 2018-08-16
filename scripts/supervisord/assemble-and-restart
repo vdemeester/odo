@@ -1,0 +1,42 @@
+#!/bin/bash
+set -x
+set -eo pipefail
+
+# S2i fails when /tmp/src/ is empty. 
+# Here we will create an empty folder / dummy file
+mkdir -p /tmp/src
+touch /tmp/src/.dummy
+
+# HACK. For some reason, *somewhere* $PATH is being overriden and the default
+# "/opt/rh/" is not being added. We instead manually search for the binaries and add it
+# to $PATH.
+# REMOVE THIS BEFORE MERGING.
+for i in $(find /opt/rh/ -name 'bin' -type d | grep '/root/usr/bin'); do
+        PATH=$i:$PATH
+done
+
+# Override PATH for the assemble script so that /usr/bin precedes
+# /opt/app-root/bin so wrong Python version isn't found during setup
+# if using Python S2I base image.
+# as per: https://github.com/openshift-evangelists/pseudo-vps-quickstart/blob/master/.s2i/bin/assemble#L7
+PATH=/usr/bin:$PATH
+
+# Override HOME directory for the assemble script so that per user
+# files are not installed under /opt/app-root/src. This means that
+# the per user Python area is located under /opt/app-root/.local.
+HOME=/opt/app-root
+
+# Fix permissions before running
+fix-permissions $HOME/src
+fix-permissions $HOME
+
+# We now run the assembly script. If there is a custom one written in the 
+# source files, we use that instead.
+if [ -f /opt/app-root/src/.s2i/bin/assemble ]; then
+    /opt/app-root/src/.s2i/bin/assemble
+else
+    /usr/libexec/s2i/assemble
+fi
+
+# Restart supervisord in order to actualy run the application
+/var/lib/supervisord/bin/supervisord ctl reload
