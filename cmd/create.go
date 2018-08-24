@@ -169,8 +169,8 @@ A full list of component types that can be deployed is available using: 'odo com
 			err = component.CreateFromPath(client, componentName, componentImageName, dir, applicationName, "local", componentPorts)
 			checkError(err, "")
 			fmt.Printf("Please wait, creating %s component ...\n", componentName)
-			err = component.Build(client, componentName, applicationName, false, true, stdout)
-			checkError(err, "")
+			// err = component.Build(client, componentName, applicationName, false, true, stdout)
+			// checkError(err, "")
 		}
 
 		ports, err := component.GetComponentPorts(client, componentName, applicationName)

@@ -59,13 +59,15 @@ const (
 	// The length of the string to be generated for names of resources
 	nameLength = 5
 
+	// TODO: we don't need this anymore
 	// Git repository that will be used for bootstraping
 	bootstrapperURI = "https://github.com/kadel/bootstrap-supervisored-s2i"
 	bootstrapperRef = "v0.0.2"
 
 	// Docker image that will be use containing the supervisord binary as well
 	// as the assemble / run / restart scripts
-	bootstrapperImage = "docker.io/cdrage/supervisord-test:latest"
+	// TODO: refer to image using hash
+	bootstrapperImage = "quay.io/tomkral/supervisord-test:latest"
 )
 
 // errorMsg is the message for user when invalid configuration error occurs
@@ -620,6 +622,10 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 					Labels: map[string]string{
 						"deploymentconfig": name,
 					},
+					// https://github.com/redhat-developer/odo/pull/622#issuecomment-413410736
+					Annotations: map[string]string{
+						"alpha.image.policy.openshift.io/resolve-names": "*",
+					},
 				},
 				Spec: corev1.PodSpec{
 
@@ -672,6 +678,7 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 						Automatic: true,
 						ContainerNames: []string{
 							name,
+							"copy-files-to-volume", // TODO: probably shouldn't be hardcored
 						},
 						From: corev1.ObjectReference{
 							Kind:      "ImageStreamTag",
@@ -689,7 +696,7 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 	addBootstrapVolume(&dc, name)
 	addBootstrapVolumeMount(&dc, name)
 
-	_, err = c.appsClient.DeploymentConfigs(c.namespace).Create(&dc)
+	createdDC, err := c.appsClient.DeploymentConfigs(c.namespace).Create(&dc)
 	if err != nil {
 		return errors.Wrapf(err, "unable to create DeploymentConfig for %s", name)
 	}
@@ -702,6 +709,14 @@ func (c *Client) BootstrapSupervisoredS2I(name string, builderImage string, labe
 	_, err = c.CreatePVC(getAppRootVolumeName(name), "1Gi", labels)
 	if err != nil {
 		return errors.Wrapf(err, "unable to create PVC for %s", name)
+	}
+
+	// TODO: allow to turn waiting off when some flag is set
+	// Block until pod is in Running state. Otherwise user might try to push pod that is not yet running.
+	podSelector := util.ConvertLabelsToSelector(createdDC.Spec.Selector)
+	_, err = c.WaitAndGetPod(podSelector)
+	if err != nil {
+		return errors.Wrapf(err, "unable to wait for Pod with selector: %s", podSelector)
 	}
 
 	return nil
@@ -745,13 +760,46 @@ func (c *Client) CreateService(commonObjectMeta metav1.ObjectMeta, containerPort
 func addBootstrapInitContainer(dc *appsv1.DeploymentConfig, dcName string) {
 	dc.Spec.Template.Spec.InitContainers = append(dc.Spec.Template.Spec.InitContainers,
 		corev1.Container{
-			Name: "copy-files-to-volume",
-			// TODO need to use custom image here (copy files over + combination of supervisord image too)
-			Image: bootstrapperImage,
+			Name:            "copy-files-to-volume",
+			Image:           dc.Spec.Template.Spec.Containers[0].Image,
+			ImagePullPolicy: corev1.PullAlways, // TODO: this is just for easier updating during odo development
 			Command: []string{
-				"copy-files-to-volume",
-				"/opt/app-root",
-				"/mnt/app-root"},
+				"sh",
+				"-c"},
+			// TODO: script needs cleanup, as we probably don't need stuff around JUPYTER_SYNC_VOLUME
+			// source https://github.com/jupyter-on-openshift/jupyter-notebooks/blob/master/minimal-notebook/setup-volume.sh
+			Args: []string{`
+SRC=/opt/app-root
+DEST=/mnt/app-root
+
+if [ -f $DEST/.delete-volume ]; then
+    rm -rf $DEST
+fi
+
+if [ -d $DEST ]; then
+    if [ -f $DEST/.sync-volume ]; then
+        if ! [[ "$JUPYTER_SYNC_VOLUME" =~ ^(false|no|n|0)$ ]]; then
+            JUPYTER_SYNC_VOLUME=yes
+        fi
+    fi
+
+    if [[ "$JUPYTER_SYNC_VOLUME" =~ ^(true|yes|y|1)$ ]]; then
+        rsync -ar --ignore-existing $SRC/. $DEST
+    fi
+
+    exit
+fi
+
+if [ -d $DEST.setup-volume ]; then
+    rm -rf $DEST.setup-volume
+fi
+
+mkdir -p $DEST.setup-volume
+
+tar -C $SRC -cf - . | tar -C $DEST.setup-volume -xvf -
+
+mv $DEST.setup-volume $DEST
+			`},
 			VolumeMounts: []corev1.VolumeMount{
 				{
 					Name:      getAppRootVolumeName(dcName),
@@ -764,16 +812,11 @@ func addBootstrapInitContainer(dc *appsv1.DeploymentConfig, dcName string) {
 // addBootstrapSupervisordInitContainer creates an init container that will copy over
 // supervisord to the application image during the start-up procress.
 func addBootstrapSupervisordInitContainer(dc *appsv1.DeploymentConfig, dcName string) {
-
-	// TODO: Use a release process to use an appriate image based on the release (0.1.0, HEAD, etc.)
-	// TODO: Maybe even make this a configurable container (for development at least too), since this will
-	// be pulled publically
-	image := "docker.io/cdrage/supervisord-test:latest"
-
 	dc.Spec.Template.Spec.InitContainers = append(dc.Spec.Template.Spec.InitContainers,
 		corev1.Container{
-			Name:  "copy-supervisord",
-			Image: image,
+			Name:            "copy-supervisord",
+			Image:           bootstrapperImage,
+			ImagePullPolicy: corev1.PullAlways, // TODO: this is just for easier updating during odo development
 			VolumeMounts: []corev1.VolumeMount{
 				{
 					Name:      "shared-data",
@@ -787,14 +830,6 @@ func addBootstrapSupervisordInitContainer(dc *appsv1.DeploymentConfig, dcName st
 				"-r",
 				"/opt/supervisord",
 				"/var/lib/",
-			},
-			// TODO : The following list should be calculated based on the labels of the S2I image, otherwise, we should be
-			// retrieveing the arguments from either the inside of the container OR from an OpenShift label/annotation
-			Env: []corev1.EnvVar{
-				{
-					Name:  "CMDS",
-					Value: "echo:/var/lib/supervisord/conf/echo.sh;run-java:/usr/local/s2i/run;compile-java:/usr/local/s2i/assemble;build:/deployments/buildapp",
-				},
 			},
 		})
 }
